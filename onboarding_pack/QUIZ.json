@@ -1,0 +1,50 @@
+[
+  {
+    "id": "Q-QJS-1",
+    "module": "src/queue.js",
+    "difficulty": "expert",
+    "question": "In the `worked()` callback, the condition on line 261 checks `if (self.errorHandler)`, but the errorHandler is invoked on line 262 regardless of whether `err` is null. What is the exact bug this creates, and under what execution scenario would a user observe incorrect behavior?",
+    "answer": "The bug is that the global error handler fires for ALL task completions (successful or not), not just errors. The errorHandler is called with (err, val) unconditionally if it is registered. If a task succeeds (err === null), the errorHandler still fires, causing user code expecting error-only notifications to handle spurious null-error events. A user observes this by registering an error handler with `queue.error(handler)`, pushing a task that completes successfully, and observing the handler being invoked with `err === null` and the task value.",
+    "tags": ["error-handling", "worker-lifecycle", "callback-semantics"]
+  },
+  {
+    "id": "Q-QJS-2",
+    "module": "src/queue.js",
+    "difficulty": "expert",
+    "question": "The `release()` function on line 170 checks `_running <= _concurrency` before dequeuing, while the concurrency setter on line 46 checks `_running < _concurrency` before incrementing and calling release. Explain the inconsistency and the concrete failure scenario it causes.",
+    "answer": "The inconsistency is that `release()` uses `<=` (allowing at-capacity workers to spawn one more), while the setter uses `<` (strict capacity gate). When concurrency is lowered and then raised, or when the setter loop runs immediately after task completion, the `<=` check in release can allow exceeding the new concurrency limit. For example: concurrency=1, one task running (_running=1), setter raises concurrency to 2, enters loop checking `1 < 2` (true), increments `_running` to 2, calls release which checks `2 <= 2` (true), dequeues and dispatches a third worker, making `_running=3`. Now concurrency is violated. The failure is over-concurrency: more workers execute simultaneously than the concurrency ceiling allows.",
+    "tags": ["concurrency", "fencepost", "setter", "release"]
+  },
+  {
+    "id": "Q-PJS-1",
+    "module": "src/promise.js",
+    "difficulty": "expert",
+    "question": "In the `push()` and `unshift()` implementations, why is `.catch(noop)` attached to the promise before returning it? What specific problem does this solve, and what are the consequences for error visibility?",
+    "answer": "The `.catch(noop)` at lines 308 and 327 prevents Node.js from emitting an `unhandledRejection` event if the consumer does not attach their own rejection handler to the returned promise. This is intentional: if the worker throws and the user does not await or `.catch()` the promise, the error would normally trigger an unhandledRejection event, causing the process to exit in strict mode. By attaching a no-op handler, JavaScript marks the promise as 'handled,' silencing the event. However, the consequence is that errors become silently invisible if the user ignores the returned promise entirely. The error still exists on the promise chain, but if it is never awaited and no `.catch()` is attached, the error is swallowed completely. The design trades off strict error signaling for developer convenience — developers can safely ignore returned promises without crashing their process, but they must explicitly await or handle the promises to see errors.",
+    "tags": ["promise", "unhandledRejection", "error-visibility", "noop"]
+  },
+  {
+    "id": "Q-PJS-2",
+    "module": "src/promise.js",
+    "difficulty": "expert",
+    "question": "Trace the full journey of an error thrown by an async worker function through the system, from the worker throwing to the consumer's `await queue.push()` rejecting. Identify each bridging point and which JavaScript mechanisms handle the transition.",
+    "answer": "When a worker function (async) throws or returns a rejected promise: (1) Line 277 calls `worker.call(this, arg)`, which returns a Promise. If the worker throws synchronously, this returns a rejected promise immediately. (2) Lines 278–280: `.then(function (res) { cb(null, res) }, cb)` chains to this Promise. The second argument `cb` is the rejection handler — if the worker's promise rejects, `cb(error)` is called. (3) `cb` is set to `next.worked`, defined at lines 255–266 in the Task lifecycle. (4) Line 264 calls `callback.call(self.context, err, result)` where `callback` is the function passed from the Promise executor in `push()`. (5) That callback calls `reject(err)` if error is present, which rejects the promise returned to the user. (6) The rejected promise is caught by the consumer's `await` in a try/catch, or by a `.catch()` handler. The key bridging points are: asyncWrapper's `.then()` converts promise rejection to callback invocation; the Task `worked()` callback converts callback invocation back to promise rejection via the executor's reject function.",
+    "tags": ["promise", "async-bridge", "error-propagation", "worked-callback"]
+  },
+  {
+    "id": "Q-TEST-1",
+    "module": "src/test/",
+    "difficulty": "expert",
+    "question": "In `test.js`, the 'abort callbacks can safely add tasks' test validates that when `abort()` is called on a paused queue with tasks ('active', 'aborted-1', 'aborted-2'), the running task ('active') continues, and the abort callbacks for 'aborted-1' and 'aborted-2' immediately push new tasks ('new-1-a', 'new-1-b', 'new-2-a', 'new-2-b'). According to the test's assertions and the expected array, in what order will the newly added tasks execute relative to each other and the active task? The queue has concurrency=1 throughout.",
+    "answer": "The execution order is exactly: 'active' (already running), then 'new-1-a', 'new-1-b', 'new-2-a', 'new-2-b'. The test's `expected` array is `['active', 'new-1-a', 'new-1-b', 'new-2-a', 'new-2-b']`. When abort() is called, the aborted task callbacks execute synchronously and push new tasks into the queue while 'active' is still running. With concurrency=1, the queue processes the added tasks in FIFO order (all push operations). The test validates this by collecting a `started` array and asserting `t.deepEqual(started, expected)` after all finish callbacks execute.",
+    "tags": ["abort", "re-entrancy", "fifo", "concurrency", "test-suite"]
+  },
+  {
+    "id": "Q-TEST-2",
+    "module": "src/test/",
+    "difficulty": "expert",
+    "question": "In `promise.js` tests, the 'drained waits for running tasks after abort' test verifies that when `abort()` is called after pushing two tasks (one running, one queued) to a queue with concurrency=1, the `drained()` promise does not resolve until the running task completes. The test checks `t.equal(queue.running(), 1, 'running task is preserved')` and later `t.equal(queue.running(), 0, 'running returns to zero')`. What do these two assertions collectively demonstrate about how `abort()` differs semantically from `kill()` or `killAndDrain()`?",
+    "answer": "The two assertions demonstrate that `abort()` does NOT immediately stop running tasks — it preserves the running task count at 1 and only clears the queue of pending tasks (the second push). In contrast, `kill()` would prevent any pending tasks from being executed (like abort), but kill does not invoke callbacks for cleared tasks. `killAndDrain()` clears the queue and fires the drain callback. What makes `abort()` distinct is that it: (1) clears only QUEUED tasks, not running ones; (2) invokes each cleared task's callback with Error('abort'); and (3) preserves the running counter for in-flight tasks. After `finish()` is called (the running task completes), the running count returns to 0 naturally, at which point `drained()` resolves. This proves `drained()` respects the running task's natural completion boundary, even after an abort.",
+    "tags": ["abort", "drained", "running-counter", "kill", "killAndDrain", "promise-test"]
+  }
+]
